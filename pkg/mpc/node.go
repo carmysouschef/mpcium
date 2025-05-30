@@ -1,9 +1,10 @@
 package mpc
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
@@ -13,6 +14,7 @@ import (
 	"github.com/fystack/mpcium/pkg/kvstore"
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/messaging"
+	"github.com/fystack/mpcium/pkg/mpc/implement/session"
 	"github.com/google/uuid"
 )
 
@@ -21,8 +23,6 @@ const (
 	PurposeSign      string = "sign"
 	PurposeResharing string = "resharing"
 )
-
-type ID string
 
 type Node struct {
 	nodeID  string
@@ -38,24 +38,6 @@ type Node struct {
 	peerRegistry PeerRegistry
 }
 
-func CreatePartyID(nodeID string, label string) *tss.PartyID {
-	partyID := uuid.NewString()
-	key := big.NewInt(0).SetBytes([]byte(nodeID + ":" + label))
-	return tss.NewPartyID(partyID, label, key)
-}
-
-func PartyIDToNodeID(partyID *tss.PartyID) string {
-	return string(partyID.KeyInt().Bytes())
-}
-
-func ComparePartyIDs(x, y *tss.PartyID) bool {
-	return bytes.Equal(x.KeyInt().Bytes(), y.KeyInt().Bytes())
-}
-
-func ComposeReadyKey(nodeID string) string {
-	return fmt.Sprintf("ready/%s", nodeID)
-}
-
 func NewNode(
 	nodeID string,
 	peerIDs []string,
@@ -66,12 +48,12 @@ func NewNode(
 	peerRegistry PeerRegistry,
 	identityStore identity.Store,
 ) *Node {
-	preParams, err := keygen.GeneratePreParams(5 * time.Minute)
+
+	preParams, err := loadPreParams()
 	if err != nil {
 		logger.Fatal("Generate pre params failed", err)
 	}
 	logger.Info("Starting new node, preparams is generated successfully!")
-
 	go peerRegistry.WatchPeersReady()
 
 	return &Node{
@@ -87,234 +69,112 @@ func NewNode(
 	}
 }
 
-func (p *Node) ID() string {
-	return p.nodeID
+func (n *Node) CreateKeyGenSession(curveType CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (session.Session, error) {
+	if n.peerRegistry.GetReadyPeersCount() < int64(threshold+1) {
+		return nil, fmt.Errorf("not enough peers to create gen session! Expected %d, got %d", threshold+1, n.peerRegistry.GetReadyPeersCount())
+	}
+
+	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
+	selfPartyID, allPartyIDs := n.generatePartyIDs(PurposeKeygen, readyPeerIDs)
+
+	switch curveType {
+	case CurveECDSA:
+		return session.NewECDSASession(n.nodeID, walletID, readyPeerIDs, selfPartyID, allPartyIDs, threshold), nil
+	case CurveEDDSA:
+		return session.NewEDDASession(n.nodeID, walletID, readyPeerIDs, selfPartyID, allPartyIDs, threshold), nil
+	default:
+		return nil, fmt.Errorf("invalid curve type: %s", curveType)
+	}
 }
 
-func (p *Node) CreateKeyGenSession(walletID string, threshold int, successQueue messaging.MessageQueue) (*KeygenSession, error) {
-	if p.peerRegistry.GetReadyPeersCount() < int64(threshold+1) {
-		return nil, fmt.Errorf("Not enough peers to create gen session! Expected %d, got %d", threshold+1, p.peerRegistry.GetReadyPeersCount())
-	}
+// func (n *Node) CreateSigningSession(curveType CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (ISigningSession, error) {
+// 	if n.peerRegistry.GetReadyPeersCount() < int64(threshold+1) {
+// 		return nil, fmt.Errorf("not enough peers to create signing session! Expected %d, got %d", threshold+1, n.peerRegistry.GetReadyPeersCount())
+// 	}
 
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
-	selfPartyID, allPartyIDs := p.generatePartyIDs(PurposeKeygen, readyPeerIDs)
-	session := NewKeygenSession(
-		walletID,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		allPartyIDs,
-		threshold,
-		p.ecdsaPreParams,
-		p.kvstore,
-		p.keyinfoStore,
-		successQueue,
-		p.identityStore,
-	)
-	return session, nil
-}
+// 	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
+// 	selfPartyID, allPartyIDs := n.generatePartyIDs(PurposeSign, readyPeerIDs)
 
-func (p *Node) CreateEDDSAKeyGenSession(walletID string, threshold int, successQueue messaging.MessageQueue) (*EDDSAKeygenSession, error) {
-	if p.peerRegistry.GetReadyPeersCount() < int64(threshold+1) {
-		return nil, fmt.Errorf("Not enough peers to create gen session! Expected %d, got %d", threshold+1, p.peerRegistry.GetReadyPeersCount())
-	}
+// 	switch curveType {
+// 	case CurveECDSA:
+// 		return NewECDSSigningSession(walletID, n.pubSub, n.direct, readyPeerIDs, selfPartyID, allPartyIDs, threshold, n.ecdsaPreParams, n.kvstore, n.keyinfoStore, successQueue, n.identityStore)
+// 	case CurveEDDSA:
+// 		return NewEDDASigningSession(walletID, n.pubSub, n.direct, readyPeerIDs, selfPartyID, allPartyIDs, threshold, n.kvstore, n.keyinfoStore, successQueue, n.identityStore)
+// 	default:
+// 		return nil, fmt.Errorf("invalid curve type: %s", curveType)
+// 	}
+// }
 
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
-	selfPartyID, allPartyIDs := p.generatePartyIDs(PurposeKeygen, readyPeerIDs)
-	session := NewEDDSAKeygenSession(
-		walletID,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		allPartyIDs,
-		threshold,
-		p.kvstore,
-		p.keyinfoStore,
-		successQueue,
-		p.identityStore,
-	)
-	return session, nil
-}
+// func (n *Node) CreateResharingSession(curveType CurveType, walletID string, oldThreshold int, newThreshold int, successQueue messaging.MessageQueue) (IResharingSession, error) {
+// 	if n.peerRegistry.GetReadyPeersCount() < int64(newThreshold+1) {
+// 		return nil, fmt.Errorf("not enough peers to create resharing session! Expected %d, got %d", newThreshold+1, n.peerRegistry.GetReadyPeersCount())
+// 	}
 
-func (p *Node) CreateSigningSession(
-	walletID string,
-	txID string,
-	networkInternalCode string,
-	threshold int,
-	resultQueue messaging.MessageQueue,
-) (*SigningSession, error) {
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
-	keyInfo, err := p.keyinfoStore.Get(fmt.Sprintf("eddsa:%s", walletID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get key info: %w", err)
-	}
-	var selfPartyID *tss.PartyID
-	var allPartyIDs []*tss.PartyID
-	if keyInfo.IsReshared {
-		selfPartyID, allPartyIDs = p.generatePartyIDs(PurposeResharing, readyPeerIDs)
-	} else {
-		selfPartyID, allPartyIDs = p.generatePartyIDs(PurposeKeygen, readyPeerIDs)
-	}
-	session := NewSigningSession(
-		walletID,
-		txID,
-		networkInternalCode,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		allPartyIDs,
-		threshold,
-		p.ecdsaPreParams,
-		p.kvstore,
-		p.keyinfoStore,
-		resultQueue,
-		p.identityStore,
-	)
-	return session, nil
-}
+// 	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
+// 	selfPartyID, allPartyIDs := n.generatePartyIDs(PurposeSign, readyPeerIDs)
 
-func (p *Node) CreateEDDSASigningSession(
-	walletID string,
-	txID string,
-	networkInternalCode string,
-	threshold int,
-	resultQueue messaging.MessageQueue,
-) (*EDDSASigningSession, error) {
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
-	keyInfo, err := p.keyinfoStore.Get(fmt.Sprintf("eddsa:%s", walletID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get key info: %w", err)
-	}
-	var selfPartyID *tss.PartyID
-	var allPartyIDs []*tss.PartyID
-	if keyInfo.IsReshared {
-		selfPartyID, allPartyIDs = p.generatePartyIDs(PurposeResharing, readyPeerIDs)
-	} else {
-		selfPartyID, allPartyIDs = p.generatePartyIDs(PurposeKeygen, readyPeerIDs)
-	}
-	session := NewEDDSASigningSession(
-		walletID,
-		txID,
-		networkInternalCode,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		allPartyIDs,
-		threshold,
-		p.kvstore,
-		p.keyinfoStore,
-		resultQueue,
-		p.identityStore,
-	)
-	return session, nil
-}
+// 	switch curveType {
+// 	case CurveECDSA:
+// 		return NewECDSAResharingSession(walletID, n.pubSub, n.direct, readyPeerIDs, selfPartyID, allPartyIDs, oldThreshold, newThreshold, n.ecdsaPreParams, n.kvstore, n.keyinfoStore, successQueue, n.identityStore)
+// 	case CurveEDDSA:
+// 		return NewEDDASResharingSession(walletID, n.pubSub, n.direct, readyPeerIDs, selfPartyID, allPartyIDs, oldThreshold, newThreshold, n.kvstore, n.keyinfoStore, successQueue, n.identityStore)
+// 	default:
+// 		return nil, fmt.Errorf("invalid curve type: %s", curveType)
+// 	}
+// }
 
-func (p *Node) CreateECDSAResharingSession(walletID string, isOldParticipant bool, readyPeerIDs []string, newThreshold int, resultQueue messaging.MessageQueue) (*ECDSAResharingSession, error) {
-	// Get existing key info to determine old participants
-	keyInfo, err := p.keyinfoStore.Get(fmt.Sprintf("ecdsa:%s", walletID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get key info: %w", err)
-	}
-
-	oldSelfPartyID, oldPartyIDs := p.generatePartyIDs(PurposeKeygen, keyInfo.ParticipantPeerIDs)
-	newSelfPartyID, newPartyIDs := p.generatePartyIDs(PurposeResharing, readyPeerIDs)
-
-	var selfPartyID *tss.PartyID
-	if isOldParticipant {
-		selfPartyID = oldSelfPartyID
-	} else {
-		selfPartyID = newSelfPartyID
-	}
-
-	session := ECDSANewResharingSession(
-		walletID,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		oldPartyIDs,
-		newPartyIDs,
-		keyInfo.Threshold,
-		newThreshold,
-		p.ecdsaPreParams,
-		p.kvstore,
-		p.keyinfoStore,
-		resultQueue,
-		p.identityStore,
-		isOldParticipant,
-	)
-	return session, nil
-}
-
-func (p *Node) CreeateEDDSAResharingSession(walletID string, isOldParticipant bool, readyPeerIDs []string, newThreshold int, resultQueue messaging.MessageQueue) (*EDDSAResharingSession, error) {
-	keyInfo, err := p.keyinfoStore.Get(fmt.Sprintf("eddsa:%s", walletID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to get key info: %w", err)
-	}
-
-	oldSelfPartyID, oldPartyIDs := p.generatePartyIDs(PurposeKeygen, keyInfo.ParticipantPeerIDs)
-	newSelfPartyID, newPartyIDs := p.generatePartyIDs(PurposeResharing, readyPeerIDs)
-
-	var selfPartyID *tss.PartyID
-	if isOldParticipant {
-		selfPartyID = oldSelfPartyID
-	} else {
-		selfPartyID = newSelfPartyID
-	}
-
-	session := EDDSANewResharingSession(
-		walletID,
-		p.pubSub,
-		p.direct,
-		readyPeerIDs,
-		selfPartyID,
-		oldPartyIDs,
-		newPartyIDs,
-		keyInfo.Threshold,
-		newThreshold,
-		p.kvstore,
-		p.keyinfoStore,
-		resultQueue,
-		p.identityStore,
-		isOldParticipant,
-	)
-	return session, nil
-}
-
-func (p *Node) generatePartyIDs(purpose string, readyPeerIDs []string) (self *tss.PartyID, all []*tss.PartyID) {
-	var selfPartyID *tss.PartyID
-	partyIDs := make([]*tss.PartyID, len(readyPeerIDs))
-	for i, peerID := range readyPeerIDs {
-		if peerID == p.nodeID {
-			selfPartyID = CreatePartyID(peerID, purpose)
-			partyIDs[i] = selfPartyID
-		} else {
-			partyIDs[i] = CreatePartyID(peerID, purpose)
-		}
-	}
-	allPartyIDs := tss.SortPartyIDs(partyIDs, 0)
-	return selfPartyID, allPartyIDs
-}
-
-func (p *Node) Close() {
-	err := p.peerRegistry.Resign()
+func (n *Node) Close() {
+	err := n.peerRegistry.Resign()
 	if err != nil {
 		logger.Error("Resign failed", err)
 	}
 }
 
-func (p *Node) GetKeyInfo(key string) (*keyinfo.KeyInfo, error) {
-	return p.keyinfoStore.Get(key)
+func (n *Node) generatePartyIDs(purpose string, readyPeerIDs []string) (self *tss.PartyID, all []*tss.PartyID) {
+	partyIDs := make([]*tss.PartyID, len(readyPeerIDs))
+
+	for i, peerID := range readyPeerIDs {
+		partyID := createPartyID(peerID, purpose)
+		partyIDs[i] = partyID
+
+		// Track self party ID when found
+		if peerID == n.nodeID {
+			self = partyID
+		}
+	}
+
+	return self, tss.SortPartyIDs(partyIDs, 0)
 }
 
-func (p *Node) GetReadyPeersIncludeSelf() []string {
-	return p.peerRegistry.GetReadyPeersIncludeSelf()
+func createPartyID(nodeID string, purpose string) *tss.PartyID {
+	partyID := uuid.NewString()
+	key := big.NewInt(0).SetBytes([]byte(nodeID + ":" + purpose))
+	return tss.NewPartyID(partyID, purpose, key)
 }
 
-func (p *Node) GetKVStore() kvstore.KVStore {
-	return p.kvstore
+func loadPreParams() (*keygen.LocalPreParams, error) {
+	const preParamsFile = "preparams.json"
+
+	// Try to load from file first
+	if data, err := os.ReadFile(preParamsFile); err == nil {
+		preParams := new(keygen.LocalPreParams)
+		if err := json.Unmarshal(data, preParams); err == nil {
+			return preParams, nil
+		}
+	}
+
+	// If file doesn't exist or is invalid, generate new pre-params
+	preParams, err := keygen.GeneratePreParams(1*time.Minute, 8)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate pre-params: %w", err)
+	}
+
+	// Save to file for future use
+	if data, err := json.Marshal(preParams); err == nil {
+		if err := os.WriteFile(preParamsFile, data, 0644); err != nil {
+			logger.Warn("Failed to save pre-params to file", "error", err)
+		}
+	}
+
+	return preParams, nil
 }

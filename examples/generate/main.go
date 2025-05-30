@@ -7,20 +7,19 @@ import (
 	"syscall"
 
 	"github.com/fystack/mpcium/pkg/client"
-	"github.com/fystack/mpcium/pkg/config"
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/mpc"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
-	"github.com/spf13/viper"
 )
 
 func main() {
 	const environment = "development"
-	config.InitViperConfig()
+	// config.InitViperConfig()
 	logger.Init(environment, false)
 
-	natsURL := viper.GetString("nats.url")
+	// natsURL := viper.GetString("nats.url")
+	natsURL := "nats://localhost:4222"
 	natsConn, err := nats.Connect(natsURL)
 	if err != nil {
 		logger.Fatal("Failed to connect to NATS", err)
@@ -30,7 +29,7 @@ func main() {
 
 	mpcClient := client.NewMPCClient(client.Options{
 		NatsConn: natsConn,
-		KeyPath:  "./event_initiator.key",
+		KeyPath:  "./../../event_initiator.key",
 	})
 	err = mpcClient.OnWalletCreationResult(func(event mpc.KeygenSuccessEvent) {
 		logger.Info("Received wallet creation result", "event", event)
