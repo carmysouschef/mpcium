@@ -172,6 +172,23 @@ func (ec *eventConsumer) consumeKeyGenerationEvent() error {
 		// Wait for both operations to complete
 		wg.Wait()
 
+		successEvent := mpc.KeygenSuccessEvent{
+			WalletID:    msg.WalletID,
+			ECDSAPubKey: ecdsaSession.GetPubKey(),
+			EDDSAPubKey: eddsaSession.GetPubKey(),
+		}
+		successEventBytes, err := json.Marshal(successEvent)
+		if err != nil {
+			logger.Error("Failed to marshal success event", err)
+			return
+		}
+		err = ec.keygenResultQueue.Enqueue(fmt.Sprintf(mpc.TypeGenerateWalletSuccess, msg.WalletID), successEventBytes, &messaging.EnqueueOptions{
+			IdempotententKey: fmt.Sprintf(mpc.TypeGenerateWalletSuccess, msg.WalletID),
+		})
+		if err != nil {
+			logger.Error("Failed to publish key generation success message", err)
+			return
+		}
 	})
 
 	if err != nil {

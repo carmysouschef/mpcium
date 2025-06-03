@@ -6,6 +6,9 @@ const (
 	CurveECDSA CurveType = "ecdsa"
 	CurveEDDSA CurveType = "eddsa"
 )
+const (
+	TypeGenerateWalletSuccess = "mpc.mpc_keygen_success.%s"
+)
 
 type KeygenSuccessEvent struct {
 	WalletID    string `json:"wallet_id"`
