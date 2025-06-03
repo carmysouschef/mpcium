@@ -1,6 +1,7 @@
-package eddsa
+package session
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,33 +11,33 @@ import (
 	"github.com/bnb-chain/tss-lib/v2/eddsa/resharing"
 	"github.com/bnb-chain/tss-lib/v2/eddsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
-	"github.com/fystack/mpcium/pkg/mpc/implement"
+	"github.com/decred/dcrd/dcrec/edwards/v2"
 )
 
 type EDDSAParty struct {
-	implement.BaseParty
+	BaseParty
 	shareData *keygen.LocalPartySaveData
 }
 
-func NewEDDSAParty(partyID string) *EDDSAParty {
+func NewEDDSAParty(partyID *tss.PartyID) *EDDSAParty {
 	party := &EDDSAParty{
-		BaseParty: *implement.NewBaseParty(partyID),
+		BaseParty: *NewBaseParty(partyID),
 	}
-	party.SetCurve(tss.Edwards())
+	party.curve = tss.Edwards()
 	return party
 }
 
-func (p *EDDSAParty) Init(participants []string, threshold int, sender implement.Sender) {
+func (p *EDDSAParty) Init(participants tss.SortedPartyIDs, threshold int, sender Sender) {
 	p.BaseParty.Init(participants, threshold, sender)
 }
 
-func (p *EDDSAParty) InitReshare(oldParticipants []string, newParticipants []string, oldThreshold int, newThreshold int, sender implement.Sender) {
+func (p *EDDSAParty) InitReshare(oldParticipants tss.SortedPartyIDs, newParticipants tss.SortedPartyIDs, oldThreshold int, newThreshold int, sender Sender) {
 	p.BaseParty.InitReshare(oldParticipants, newParticipants, oldThreshold, newThreshold, sender)
 }
 
-func (p *EDDSAParty) Keygen(done func(*keygen.LocalPartySaveData)) {
-	log.Printf("Party %s starting keygen\n", p.PartyID.Id)
-	defer log.Printf("Party %s ending keygen\n", p.PartyID.Id)
+func (p *EDDSAParty) Keygen(ctx context.Context, done func([]byte)) {
+	log.Printf("Party %s starting keygen\n", p.PartyID.String())
+	defer log.Printf("Party %s ending keygen\n", p.PartyID.String())
 
 	endCh := make(chan *keygen.LocalPartySaveData, 1)
 	localParty := keygen.NewLocalParty(p.Params, p.Out, endCh)
@@ -49,20 +50,26 @@ func (p *EDDSAParty) Keygen(done func(*keygen.LocalPartySaveData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case share := <-endCh:
 			if done != nil {
-				done(share)
+				bz, err := json.Marshal(share)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
 }
 
-func (p *EDDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
+func (p *EDDSAParty) Sign(ctx context.Context, msg []byte, done func([]byte)) {
 	log.Printf("Party %s starting sign\n", p.PartyID.Id)
 	defer log.Printf("Party %s ending sign\n", p.PartyID.Id)
 
@@ -72,7 +79,7 @@ func (p *EDDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
 	}
 
 	endCh := make(chan *common.SignatureData, 1)
-	msgToSign := p.HashToInt(msg)
+	msgToSign := p.hashToInt(msg)
 	localParty := signing.NewLocalParty(msgToSign, p.Params, *p.shareData, p.Out, endCh)
 
 	go func() {
@@ -84,22 +91,28 @@ func (p *EDDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case sig := <-endCh:
 			if done != nil {
-				done(sig)
+				bz, err := json.Marshal(sig)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
 }
 
-func (p *EDDSAParty) Reshare(done func(*keygen.LocalPartySaveData)) {
-	log.Printf("Party %s starting reshare\n", p.PartyID.Id)
-	defer log.Printf("Party %s ending reshare\n", p.PartyID.Id)
+func (p *EDDSAParty) Reshare(ctx context.Context, done func([]byte)) {
+	log.Printf("Party %s starting reshare\n", p.PartyID.String())
+	defer log.Printf("Party %s ending reshare\n", p.PartyID.String())
 
 	// Initialize share data for new participants
 	if p.shareData == nil {
@@ -118,17 +131,36 @@ func (p *EDDSAParty) Reshare(done func(*keygen.LocalPartySaveData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case share := <-endCh:
 			if done != nil {
-				done(share)
+				bz, err := json.Marshal(share)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
+}
+
+func (p *EDDSAParty) GetPubKey() []byte {
+	publicKey := p.shareData.EDDSAPub
+	pkX, pkY := publicKey.X(), publicKey.Y()
+	pk := edwards.PublicKey{
+		Curve: p.curve,
+		X:     pkX,
+		Y:     pkY,
+	}
+
+	pubKeyBytes := pk.SerializeCompressed()
+	return pubKeyBytes
 }
 
 func (p *EDDSAParty) SetShareData(shareData []byte) {
@@ -147,12 +179,12 @@ func (p *EDDSAParty) SetShareData(shareData []byte) {
 	}
 
 	// Set curve for all points
-	localSaveData.EDDSAPub.SetCurve(p.GetCurve())
+	localSaveData.EDDSAPub.SetCurve(p.curve)
 	for _, xj := range localSaveData.BigXj {
 		if xj == nil {
 			p.ErrChan <- fmt.Errorf("share data has nil public share")
 		}
-		xj.SetCurve(p.GetCurve())
+		xj.SetCurve(p.curve)
 	}
 
 	p.shareData = &localSaveData

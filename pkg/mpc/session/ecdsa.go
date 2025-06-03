@@ -1,6 +1,8 @@
-package ecdsa
+package session
 
 import (
+	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,36 +12,37 @@ import (
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/resharing"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
-	"github.com/fystack/mpcium/pkg/mpc/implement"
+	"github.com/fystack/mpcium/pkg/encoding"
+	"github.com/fystack/mpcium/pkg/logger"
 )
 
 type ECDSAParty struct {
-	implement.BaseParty
+	BaseParty
 	preParams keygen.LocalPreParams
 	shareData *keygen.LocalPartySaveData
 }
 
-func NewECDSAParty(partyID string) *ECDSAParty {
+func NewECDSAParty(partyID *tss.PartyID) *ECDSAParty {
 	party := &ECDSAParty{
-		BaseParty: *implement.NewBaseParty(partyID),
+		BaseParty: *NewBaseParty(partyID),
 	}
-	party.SetCurve(tss.S256())
+	party.curve = tss.S256()
 	return party
 }
 
-func (p *ECDSAParty) Init(participants []string, threshold int, preParams keygen.LocalPreParams, sender implement.Sender) {
+func (p *ECDSAParty) Init(participants tss.SortedPartyIDs, threshold int, preParams keygen.LocalPreParams, sender Sender) {
 	p.preParams = preParams
 	p.BaseParty.Init(participants, threshold, sender)
 }
 
-func (p *ECDSAParty) InitReshare(oldParticipants []string, newParticipants []string, oldThreshold int, newThreshold int, preParams keygen.LocalPreParams, sender implement.Sender) {
+func (p *ECDSAParty) InitReshare(oldParticipants tss.SortedPartyIDs, newParticipants tss.SortedPartyIDs, oldThreshold int, newThreshold int, preParams keygen.LocalPreParams, sender Sender) {
 	p.preParams = preParams
 	p.BaseParty.InitReshare(oldParticipants, newParticipants, oldThreshold, newThreshold, sender)
 }
 
-func (p *ECDSAParty) Keygen(done func(*keygen.LocalPartySaveData)) {
-	log.Printf("Party %s starting keygen\n", p.PartyID.Id)
-	defer log.Printf("Party %s ending keygen\n", p.PartyID.Id)
+func (p *ECDSAParty) Keygen(ctx context.Context, done func([]byte)) {
+	log.Printf("Party %s starting keygen\n", p.PartyID.String())
+	defer log.Printf("Party %s ending keygen\n", p.PartyID.String())
 
 	endCh := make(chan *keygen.LocalPartySaveData, 1)
 	localParty := keygen.NewLocalParty(p.Params, p.Out, endCh, p.preParams)
@@ -52,20 +55,27 @@ func (p *ECDSAParty) Keygen(done func(*keygen.LocalPartySaveData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Printf("Party %s keygen context done", p.PartyID.Id)
+			return
 		case share := <-endCh:
 			if done != nil {
-				done(share)
+				bz, err := json.Marshal(share)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
 }
 
-func (p *ECDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
+func (p *ECDSAParty) Sign(ctx context.Context, msg []byte, done func([]byte)) {
 	log.Printf("Party %s starting sign\n", p.PartyID.Id)
 	defer log.Printf("Party %s ending sign\n", p.PartyID.Id)
 
@@ -75,7 +85,7 @@ func (p *ECDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
 	}
 
 	endCh := make(chan *common.SignatureData, 1)
-	msgToSign := p.HashToInt(msg)
+	msgToSign := p.hashToInt(msg)
 	localParty := signing.NewLocalParty(msgToSign, p.Params, *p.shareData, p.Out, endCh)
 
 	go func() {
@@ -87,20 +97,26 @@ func (p *ECDSAParty) Sign(msg []byte, done func(*common.SignatureData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case sig := <-endCh:
 			if done != nil {
-				done(sig)
+				bz, err := json.Marshal(sig)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
 }
 
-func (p *ECDSAParty) Reshare(done func(*keygen.LocalPartySaveData)) {
+func (p *ECDSAParty) Reshare(ctx context.Context, done func([]byte)) {
 	log.Printf("Party %s starting reshare\n", p.PartyID.Id)
 	defer log.Printf("Party %s ending reshare\n", p.PartyID.Id)
 
@@ -122,17 +138,39 @@ func (p *ECDSAParty) Reshare(done func(*keygen.LocalPartySaveData)) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case share := <-endCh:
 			if done != nil {
-				done(share)
+				bz, err := json.Marshal(share)
+				if err != nil {
+					p.ErrChan <- err
+				}
+				done(bz)
 			}
 			return
 		case msg := <-p.In:
-			if err := p.ProcessMsg(localParty, msg); err != nil {
+			if err := p.processMsg(localParty, msg); err != nil {
 				p.ErrChan <- err
 			}
 		}
 	}
+}
+
+func (p *ECDSAParty) GetPubKey() []byte {
+	publicKey := p.shareData.ECDSAPub
+	pubKey := &ecdsa.PublicKey{
+		Curve: p.curve,
+		X:     publicKey.X(),
+		Y:     publicKey.Y(),
+	}
+
+	pubKeyBytes, err := encoding.EncodeS256PubKey(pubKey)
+	if err != nil {
+		logger.Error("failed to encode public key", err)
+		p.ErrChan <- fmt.Errorf("failed to encode public key: %w", err)
+	}
+	return pubKeyBytes
 }
 
 func (p *ECDSAParty) SetShareData(shareData []byte) {
@@ -151,12 +189,12 @@ func (p *ECDSAParty) SetShareData(shareData []byte) {
 	}
 
 	// Set curve for all points
-	localSaveData.ECDSAPub.SetCurve(p.GetCurve())
+	localSaveData.ECDSAPub.SetCurve(p.curve)
 	for _, xj := range localSaveData.BigXj {
 		if xj == nil {
 			p.ErrChan <- fmt.Errorf("share data has nil public share")
 		}
-		xj.SetCurve(p.GetCurve())
+		xj.SetCurve(p.curve)
 	}
 
 	p.shareData = &localSaveData

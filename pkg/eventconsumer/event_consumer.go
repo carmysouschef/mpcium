@@ -1,6 +1,7 @@
 package eventconsumer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/messaging"
 	"github.com/fystack/mpcium/pkg/mpc"
+	"github.com/fystack/mpcium/pkg/mpc/node"
 	"github.com/fystack/mpcium/pkg/types"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/viper"
@@ -33,7 +35,7 @@ type EventConsumer interface {
 }
 
 type eventConsumer struct {
-	node             *mpc.Node
+	node             *node.Node
 	pubsub           messaging.PubSub
 	defaultThreshold int
 
@@ -56,7 +58,7 @@ type eventConsumer struct {
 }
 
 func NewEventConsumer(
-	node *mpc.Node,
+	node *node.Node,
 	pubsub messaging.PubSub,
 	keygenResultQueue messaging.MessageQueue,
 	signingResultQueue messaging.MessageQueue,
@@ -122,19 +124,53 @@ func (ec *eventConsumer) consumeKeyGenerationEvent() error {
 		}
 
 		// Create ECDSA and EDDSA keygen sessions
-		ecdsaSession, err := ec.node.CreateKeyGenSession(mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+		fmt.Printf("About to create ECDSA session for wallet %s\n", msg.WalletID)
+		ecdsaSession, err := ec.node.CreateSession(mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 		if err != nil {
 			logger.Error("Failed to create ECDSA keygen session", err)
 			return
 		}
 
-		eddsaSession, err := ec.node.CreateKeyGenSession(mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+		fmt.Printf("About to create EDDSA session for wallet %s\n", msg.WalletID)
+		eddsaSession, err := ec.node.CreateSession(mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 		if err != nil {
 			logger.Error("Failed to create EDDSA keygen session", err)
 			return
 		}
-		fmt.Println("ecdsaSession", ecdsaSession)
-		fmt.Println("eddsaSession", eddsaSession)
+
+		// Create separate contexts for each session
+		ecdsaCtx, ecdsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		eddsaCtx, eddsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Start ECDSA keygen
+		go func() {
+			defer wg.Done()
+			defer ecdsaCancel()
+			ecdsaSession.Keygen(ecdsaCtx, func(shareData []byte) {
+				ecdsaSession.SetShareData(shareData)
+				pubKey := ecdsaSession.GetPubKey()
+				fmt.Printf("ECDSA public key: %x\n", pubKey)
+				ec.node.SaveKeyData("keygen", mpc.CurveECDSA, msg.WalletID, pubKey, ec.defaultThreshold)
+			})
+		}()
+
+		// Start EDDSA keygen
+		go func() {
+			defer wg.Done()
+			defer eddsaCancel()
+			eddsaSession.Keygen(eddsaCtx, func(shareData []byte) {
+				eddsaSession.SetShareData(shareData)
+				pubKey := eddsaSession.GetPubKey()
+				fmt.Printf("EDDSA public key: %x\n", pubKey)
+				ec.node.SaveKeyData("keygen", mpc.CurveEDDSA, msg.WalletID, pubKey, ec.defaultThreshold)
+			})
+		}()
+
+		// Wait for both operations to complete
+		wg.Wait()
 
 	})
 
