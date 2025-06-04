@@ -2,6 +2,7 @@ package session
 
 import (
 	"crypto/elliptic"
+	"fmt"
 	"log"
 	"math/big"
 
@@ -11,6 +12,12 @@ import (
 
 const (
 	defaultChanSize = 1000
+)
+
+var (
+	ErrPartyNotInitialized = fmt.Errorf("party not initialized")
+	ErrInvalidMessage      = fmt.Errorf("invalid message")
+	ErrContextCancelled    = fmt.Errorf("context cancelled")
 )
 
 type Sender func(msg tss.Message)
@@ -39,6 +46,11 @@ func NewBaseParty(partyID *tss.PartyID) *BaseParty {
 
 // Init initializes the party with basic parameters
 func (p *BaseParty) Init(sortedPartyIDs tss.SortedPartyIDs, threshold int, sender Sender) {
+	if p.PartyID == nil {
+		p.ErrChan <- ErrPartyNotInitialized
+		return
+	}
+
 	// Update the partyID index
 	ctx := tss.NewPeerContext(sortedPartyIDs)
 	p.Params = tss.NewParameters(p.curve, ctx, p.PartyID, sortedPartyIDs.Len(), threshold)
@@ -48,11 +60,10 @@ func (p *BaseParty) Init(sortedPartyIDs tss.SortedPartyIDs, threshold int, sende
 
 // InitReshare initializes the party for resharing
 func (p *BaseParty) InitReshare(oldParticipants tss.SortedPartyIDs, newParticipants tss.SortedPartyIDs, oldThreshold int, newThreshold int, sender Sender) {
-
-	// Only update index for new parties
-	// if p.PartyID.Index == -1 {
-	// 	p.PartyID.Index = GetLocalPartyIndex(newSortedPartyIDs, p.PartyID.Id)
-	// }
+	if p.PartyID == nil {
+		p.ErrChan <- ErrPartyNotInitialized
+		return
+	}
 
 	p.ReshareParams = tss.NewReSharingParameters(
 		p.curve,
@@ -72,6 +83,7 @@ func (p *BaseParty) OnMsg(msg types.TssMessage) {
 	select {
 	case p.In <- msg:
 	case <-p.closeChan:
+		log.Printf("Party %s is closed, dropping message", p.PartyID.Id)
 	}
 }
 
@@ -94,9 +106,13 @@ func (p *BaseParty) Close() {
 
 // processMsg handles message processing for any party implementation
 func (p *BaseParty) processMsg(localParty tss.Party, msg types.TssMessage) error {
+	if localParty == nil {
+		return ErrPartyNotInitialized
+	}
+
 	ok, err := localParty.UpdateFromBytes(msg.MsgBytes, msg.From, msg.IsBroadcast)
 	if !ok {
-		return err
+		return fmt.Errorf("%w: %v", ErrInvalidMessage, err)
 	}
 	return nil
 }
@@ -104,6 +120,7 @@ func (p *BaseParty) processMsg(localParty tss.Party, msg types.TssMessage) error
 // hashToInt converts a hash to a big integer, respecting the curve's order
 func (p *BaseParty) hashToInt(hash []byte) *big.Int {
 	if p.curve == nil {
+		p.ErrChan <- fmt.Errorf("curve not initialized")
 		return nil
 	}
 	orderBits := p.curve.Params().N.BitLen()
