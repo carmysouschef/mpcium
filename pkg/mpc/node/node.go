@@ -18,10 +18,7 @@ import (
 )
 
 const (
-	PurposeKeygen    = "keygen"
-	PurposeSign      = "sign"
-	PurposeResharing = "resharing"
-	maxWorkers       = 5
+	maxWorkers = 5
 )
 
 type Node struct {
@@ -68,7 +65,7 @@ func NewNode(
 }
 
 // Create a keygen/sign session
-func (n *Node) CreateSession(purpose string, curveType mpc.CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (session.Session, error) {
+func (n *Node) CreateSession(purpose mpc.Purpose, curveType mpc.CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (session.Session, error) {
 	// Validate peer count
 	if err := n.validatePeerCount(purpose, threshold); err != nil {
 		return nil, err
@@ -81,11 +78,11 @@ func (n *Node) CreateSession(purpose string, curveType mpc.CurveType, walletID s
 	var keyData []byte
 	var err error
 	switch purpose {
-	case PurposeKeygen:
+	case mpc.PurposeKeygen:
 		if err := n.handleKeygenPurpose(topicComposer, walletID); err != nil {
 			return nil, err
 		}
-	case PurposeSign:
+	case mpc.PurposeSign:
 		if keyData, err = n.handleSignPurpose(topicComposer, walletID); err != nil {
 			return nil, err
 		}
@@ -115,7 +112,7 @@ func (n *Node) CreateSession(purpose string, curveType mpc.CurveType, walletID s
 // Create a resharing session
 func (n *Node) CreateResharingSession(curveType mpc.CurveType, walletID string, oldThreshold, newThreshold int, successQueue messaging.MessageQueue) (session.Session, error) {
 	// Validate peer count
-	if err := n.validatePeerCount(PurposeResharing, newThreshold); err != nil {
+	if err := n.validatePeerCount(mpc.PurposeResharing, newThreshold); err != nil {
 		return nil, err
 	}
 	return nil, fmt.Errorf("resharing not yet implemented for curve type: %s", curveType)
@@ -152,7 +149,7 @@ func (n *Node) Close() {
 }
 
 // validatePeerCount checks if there are enough peers for the session
-func (n *Node) validatePeerCount(purpose string, threshold int) error {
+func (n *Node) validatePeerCount(purpose mpc.Purpose, threshold int) error {
 	readyCount := n.peerRegistry.GetReadyPeersCount()
 	if readyCount < int64(threshold+1) {
 		return fmt.Errorf("not enough peers for %s session: need %d, have %d",
@@ -162,10 +159,10 @@ func (n *Node) validatePeerCount(purpose string, threshold int) error {
 }
 
 // setupSessionParams initializes the basic session parameters
-func (n *Node) setupSessionParams(purpose string, curveType mpc.CurveType, walletID string) (*tss.PartyID, tss.SortedPartyIDs, *TopicComposer, session.Sender) {
+func (n *Node) setupSessionParams(purpose mpc.Purpose, curveType mpc.CurveType, walletID string) (*tss.PartyID, tss.SortedPartyIDs, *TopicComposer, session.Sender) {
 	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
 	selfPartyID, allPartyIDs := n.generatePartyIDs(purpose, readyPeerIDs)
-	topicComposer := NewTopicComposer(purpose, string(curveType), walletID)
+	topicComposer := NewTopicComposer(string(purpose), string(curveType), walletID)
 	sender := n.createSender(walletID, *topicComposer, allPartyIDs)
 	return selfPartyID, allPartyIDs, topicComposer, sender
 }
@@ -191,12 +188,12 @@ func (n *Node) handleSignPurpose(topicComposer *TopicComposer, walletID string) 
 }
 
 // createParty creates and initializes a party based on curve type
-func (n *Node) createParty(curveType mpc.CurveType, selfPartyID *tss.PartyID, allPartyIDs tss.SortedPartyIDs, threshold int, sender session.Sender, purpose string, keyData []byte) (session.Session, error) {
+func (n *Node) createParty(curveType mpc.CurveType, selfPartyID *tss.PartyID, allPartyIDs tss.SortedPartyIDs, threshold int, sender session.Sender, purpose mpc.Purpose, keyData []byte) (session.Session, error) {
 	switch curveType {
 	case mpc.CurveECDSA:
 		party := session.NewECDSAParty(selfPartyID)
 		party.Init(allPartyIDs, threshold, *n.ecdsaPreParams, sender)
-		if purpose == PurposeSign {
+		if purpose == mpc.PurposeSign {
 			party.SetShareData(keyData)
 		}
 		return party, nil
@@ -204,7 +201,7 @@ func (n *Node) createParty(curveType mpc.CurveType, selfPartyID *tss.PartyID, al
 	case mpc.CurveEDDSA:
 		party := session.NewEDDSAParty(selfPartyID)
 		party.Init(allPartyIDs, threshold, sender)
-		if purpose == PurposeSign {
+		if purpose == mpc.PurposeSign {
 			party.SetShareData(keyData)
 		}
 		return party, nil
@@ -307,12 +304,12 @@ func (n *Node) createSender(walletID string, topicComposer TopicComposer, allPar
 }
 
 // Generate party IDs for the purpose and ready peer IDs
-func (n *Node) generatePartyIDs(purpose string, readyPeerIDs []string) (*tss.PartyID, []*tss.PartyID) {
+func (n *Node) generatePartyIDs(purpose mpc.Purpose, readyPeerIDs []string) (*tss.PartyID, []*tss.PartyID) {
 	partyIDs := make([]*tss.PartyID, len(readyPeerIDs))
 	var self *tss.PartyID
 
 	for i, peerID := range readyPeerIDs {
-		pid := createPartyID(peerID, purpose)
+		pid := createPartyID(peerID, string(purpose))
 		partyIDs[i] = pid
 		if peerID == n.nodeID {
 			self = pid

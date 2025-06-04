@@ -1,11 +1,17 @@
 package mpc
 
 type CurveType string
+type Purpose string
 
 const (
 	CurveECDSA CurveType = "ecdsa"
 	CurveEDDSA CurveType = "eddsa"
+
+	PurposeKeygen    Purpose = "keygen"
+	PurposeSign      Purpose = "sign"
+	PurposeResharing Purpose = "resharing"
 )
+
 const (
 	TypeGenerateWalletSuccess = "mpc.mpc_keygen_success.%s"
 )

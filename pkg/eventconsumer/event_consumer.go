@@ -211,12 +211,12 @@ func (ec *eventConsumer) consumeResharingEvent() error {
 // handleKeygenMessage processes a single keygen message
 func (ec *eventConsumer) handleKeygenMessage(msg *types.GenerateKeyMessage) error {
 	// Create ECDSA and EDDSA keygen sessions
-	ecdsaSession, err := ec.node.CreateSession(node.PurposeKeygen, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	ecdsaSession, err := ec.node.CreateSession(mpc.PurposeKeygen, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 	if err != nil {
 		return fmt.Errorf("failed to create ECDSA keygen session: %w", err)
 	}
 
-	eddsaSession, err := ec.node.CreateSession(node.PurposeKeygen, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	eddsaSession, err := ec.node.CreateSession(mpc.PurposeKeygen, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 	if err != nil {
 		return fmt.Errorf("failed to create EDDSA keygen session: %w", err)
 	}
@@ -352,9 +352,9 @@ func (ec *eventConsumer) handleSigningMessage(msg *types.SignTxMessage, natMsg *
 func (ec *eventConsumer) createSigningSession(msg *types.SignTxMessage) (session.Session, error) {
 	switch msg.KeyType {
 	case types.KeyTypeSecp256k1:
-		return ec.node.CreateSession(node.PurposeSign, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+		return ec.node.CreateSession(mpc.PurposeSign, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 	case types.KeyTypeEd25519:
-		return ec.node.CreateSession(node.PurposeSign, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+		return ec.node.CreateSession(mpc.PurposeSign, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
 	default:
 		return nil, fmt.Errorf("invalid key type: %s", msg.KeyType)
 	}
