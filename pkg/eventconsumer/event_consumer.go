@@ -8,11 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fystack/mpcium/pkg/event"
 	"github.com/fystack/mpcium/pkg/identity"
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/messaging"
 	"github.com/fystack/mpcium/pkg/mpc"
 	"github.com/fystack/mpcium/pkg/mpc/node"
+	"github.com/fystack/mpcium/pkg/mpc/session"
 	"github.com/fystack/mpcium/pkg/types"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/viper"
@@ -123,70 +125,8 @@ func (ec *eventConsumer) consumeKeyGenerationEvent() error {
 			return
 		}
 
-		// Create ECDSA and EDDSA keygen sessions
-		fmt.Printf("About to create ECDSA session for wallet %s\n", msg.WalletID)
-		ecdsaSession, err := ec.node.CreateSession(mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
-		if err != nil {
-			logger.Error("Failed to create ECDSA keygen session", err)
-			return
-		}
-
-		fmt.Printf("About to create EDDSA session for wallet %s\n", msg.WalletID)
-		eddsaSession, err := ec.node.CreateSession(mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
-		if err != nil {
-			logger.Error("Failed to create EDDSA keygen session", err)
-			return
-		}
-
-		// Create separate contexts for each session
-		ecdsaCtx, ecdsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		eddsaCtx, eddsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// Start ECDSA keygen
-		go func() {
-			defer wg.Done()
-			defer ecdsaCancel()
-			ecdsaSession.Keygen(ecdsaCtx, func(shareData []byte) {
-				ecdsaSession.SetShareData(shareData)
-				pubKey := ecdsaSession.GetPubKey()
-				fmt.Printf("ECDSA public key: %x\n", pubKey)
-				ec.node.SaveKeyData("keygen", mpc.CurveECDSA, msg.WalletID, pubKey, ec.defaultThreshold)
-			})
-		}()
-
-		// Start EDDSA keygen
-		go func() {
-			defer wg.Done()
-			defer eddsaCancel()
-			eddsaSession.Keygen(eddsaCtx, func(shareData []byte) {
-				eddsaSession.SetShareData(shareData)
-				pubKey := eddsaSession.GetPubKey()
-				fmt.Printf("EDDSA public key: %x\n", pubKey)
-				ec.node.SaveKeyData("keygen", mpc.CurveEDDSA, msg.WalletID, pubKey, ec.defaultThreshold)
-			})
-		}()
-
-		// Wait for both operations to complete
-		wg.Wait()
-
-		successEvent := mpc.KeygenSuccessEvent{
-			WalletID:    msg.WalletID,
-			ECDSAPubKey: ecdsaSession.GetPubKey(),
-			EDDSAPubKey: eddsaSession.GetPubKey(),
-		}
-		successEventBytes, err := json.Marshal(successEvent)
-		if err != nil {
-			logger.Error("Failed to marshal success event", err)
-			return
-		}
-		err = ec.keygenResultQueue.Enqueue(fmt.Sprintf(mpc.TypeGenerateWalletSuccess, msg.WalletID), successEventBytes, &messaging.EnqueueOptions{
-			IdempotententKey: fmt.Sprintf(mpc.TypeGenerateWalletSuccess, msg.WalletID),
-		})
-		if err != nil {
-			logger.Error("Failed to publish key generation success message", err)
+		if err := ec.handleKeygenMessage(&msg); err != nil {
+			logger.Error("Failed to handle keygen message", err)
 			return
 		}
 	})
@@ -217,20 +157,19 @@ func (ec *eventConsumer) consumeTxSigningEvent() error {
 			return
 		}
 
-		// Check duplicate session
-		// Create signing session
-		// Start listening for messages
-		// Start signing
-		// Wait for session to complete
-		// Publish result
-		// Cleanup session
+		logger.Info("Received signing event", "walletID", msg.WalletID, "keyType", msg.KeyType)
+
+		if err := ec.handleSigningMessage(&msg, natMsg); err != nil {
+			logger.Error("Failed to handle signing message", err)
+			return
+		}
 	})
 
-	ec.signingSub = sub
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to subscribe to signing events: %w", err)
 	}
 
+	ec.signingSub = sub
 	return nil
 }
 
@@ -269,6 +208,236 @@ func (ec *eventConsumer) consumeResharingEvent() error {
 	return nil
 }
 
+// handleKeygenMessage processes a single keygen message
+func (ec *eventConsumer) handleKeygenMessage(msg *types.GenerateKeyMessage) error {
+	// Create ECDSA and EDDSA keygen sessions
+	ecdsaSession, err := ec.node.CreateSession(node.PurposeKeygen, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	if err != nil {
+		return fmt.Errorf("failed to create ECDSA keygen session: %w", err)
+	}
+
+	eddsaSession, err := ec.node.CreateSession(node.PurposeKeygen, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	if err != nil {
+		return fmt.Errorf("failed to create EDDSA keygen session: %w", err)
+	}
+
+	// Create contexts for sessions
+	ecdsaCtx, ecdsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	eddsaCtx, eddsaCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer ecdsaCancel()
+	defer eddsaCancel()
+
+	// Run keygen sessions concurrently
+	if err := ec.runKeygenSessions(ecdsaSession, eddsaSession, ecdsaCtx, eddsaCtx, msg.WalletID); err != nil {
+		return err
+	}
+
+	// Publish success event
+	return ec.publishKeygenSuccess(ecdsaSession, eddsaSession, msg.WalletID)
+}
+
+// runKeygenSessions runs both ECDSA and EDDSA keygen sessions concurrently
+func (ec *eventConsumer) runKeygenSessions(ecdsaSession, eddsaSession session.Session, ecdsaCtx, eddsaCtx context.Context, walletID string) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+	wg.Add(2)
+
+	// Start ECDSA keygen
+	go func() {
+		defer wg.Done()
+		ecdsaSession.Keygen(ecdsaCtx, func(shareData []byte) {
+			ecdsaSession.SetShareData(shareData)
+			pubKey := ecdsaSession.GetPubKey()
+			logger.Debug("ECDSA public key", "key", pubKey)
+			if err := ec.node.SaveKeyData("keygen", mpc.CurveECDSA, walletID, shareData, ec.defaultThreshold); err != nil {
+				errChan <- fmt.Errorf("failed to save ECDSA key data: %w", err)
+			}
+		})
+	}()
+
+	// Start EDDSA keygen
+	go func() {
+		defer wg.Done()
+		eddsaSession.Keygen(eddsaCtx, func(shareData []byte) {
+			eddsaSession.SetShareData(shareData)
+			pubKey := eddsaSession.GetPubKey()
+			logger.Debug("EDDSA public key", "key", pubKey)
+			if err := ec.node.SaveKeyData("keygen", mpc.CurveEDDSA, walletID, shareData, ec.defaultThreshold); err != nil {
+				errChan <- fmt.Errorf("failed to save EDDSA key data: %w", err)
+			}
+		})
+	}()
+
+	// Monitor error channels
+	go func() {
+		for err := range ecdsaSession.Err() {
+			logger.Error("ECDSA keygen error", err)
+		}
+		for err := range eddsaSession.Err() {
+			logger.Error("EDDSA keygen error", err)
+		}
+	}()
+
+	// Wait for completion
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// publishKeygenSuccess publishes the keygen success event
+func (ec *eventConsumer) publishKeygenSuccess(ecdsaSession, eddsaSession session.Session, walletID string) error {
+	successEvent := mpc.KeygenSuccessEvent{
+		WalletID:    walletID,
+		ECDSAPubKey: ecdsaSession.GetPubKey(),
+		EDDSAPubKey: eddsaSession.GetPubKey(),
+	}
+
+	successEventBytes, err := json.Marshal(successEvent)
+	if err != nil {
+		return fmt.Errorf("failed to marshal success event: %w", err)
+	}
+
+	err = ec.keygenResultQueue.Enqueue(
+		fmt.Sprintf(mpc.TypeGenerateWalletSuccess, walletID),
+		successEventBytes,
+		&messaging.EnqueueOptions{
+			IdempotententKey: fmt.Sprintf(mpc.TypeGenerateWalletSuccess, walletID),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to publish key generation success message: %w", err)
+	}
+
+	return nil
+}
+
+// handleSigningMessage processes a single signing message
+func (ec *eventConsumer) handleSigningMessage(msg *types.SignTxMessage, natMsg *nats.Msg) error {
+	// Check for duplicate session
+	if ec.checkDuplicateSession(msg.WalletID, msg.TxID) {
+		natMsg.Term()
+		return nil
+	}
+
+	// Create signing session
+	session, err := ec.createSigningSession(msg)
+	if err != nil {
+		ec.handleSigningSessionError(
+			msg.WalletID,
+			msg.TxID,
+			msg.NetworkInternalCode,
+			err,
+			"Failed to create signing session",
+			natMsg,
+		)
+		return err
+	}
+
+	// Mark session as active
+	ec.addSession(msg.WalletID, msg.TxID)
+
+	// Start signing process
+	return ec.startSigningProcess(session, msg, natMsg)
+}
+
+// createSigningSession creates a new signing session based on key type
+func (ec *eventConsumer) createSigningSession(msg *types.SignTxMessage) (session.Session, error) {
+	switch msg.KeyType {
+	case types.KeyTypeSecp256k1:
+		return ec.node.CreateSession(node.PurposeSign, mpc.CurveECDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	case types.KeyTypeEd25519:
+		return ec.node.CreateSession(node.PurposeSign, mpc.CurveEDDSA, msg.WalletID, ec.defaultThreshold, ec.keygenResultQueue)
+	default:
+		return nil, fmt.Errorf("invalid key type: %s", msg.KeyType)
+	}
+}
+
+// startSigningProcess starts the signing process and handles the result
+func (ec *eventConsumer) startSigningProcess(session session.Session, msg *types.SignTxMessage, natMsg *nats.Msg) error {
+	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
+
+	// Start signing in background
+	go session.Sign(ctx, msg.Tx, func(signature []byte) {
+		done()
+		logger.Info("Signing result", "signature", signature)
+
+		// Handle reply if needed
+		if natMsg.Reply != "" {
+			if err := ec.pubsub.Publish(natMsg.Reply, signature); err != nil {
+				logger.Error("Failed to publish reply", err)
+			} else {
+				logger.Info("Reply to the original message", "reply", natMsg.Reply)
+			}
+		}
+
+		err := ec.signingResultQueue.Enqueue(event.SigningResultCompleteTopic, signature, &messaging.EnqueueOptions{
+			IdempotententKey: msg.TxID,
+		})
+		if err != nil {
+			session.Err() <- err
+		}
+
+		// Cleanup session
+		ec.removeSession(msg.WalletID, msg.TxID)
+	})
+
+	// Monitor error channel
+	go ec.monitorSigningErrors(session, msg, natMsg)
+
+	return nil
+}
+
+// monitorSigningErrors monitors the session's error channel
+func (ec *eventConsumer) monitorSigningErrors(session session.Session, msg *types.SignTxMessage, natMsg *nats.Msg) {
+	for err := range session.Err() {
+		if err != nil {
+			ec.handleSigningSessionError(
+				msg.WalletID,
+				msg.TxID,
+				msg.NetworkInternalCode,
+				err,
+				"Failed to sign tx",
+				natMsg,
+			)
+			return
+		}
+	}
+}
+
+func (ec *eventConsumer) handleSigningSessionError(walletID, txID, NetworkInternalCode string, err error, errMsg string, natMsg *nats.Msg) {
+	logger.Error("Signing session error", err, "walletID", walletID, "txID", txID, "error", errMsg)
+	signingResult := event.SigningResultEvent{
+		ResultType:          event.SigningResultTypeError,
+		NetworkInternalCode: NetworkInternalCode,
+		WalletID:            walletID,
+		TxID:                txID,
+		ErrorReason:         errMsg,
+	}
+
+	signingResultBytes, err := json.Marshal(signingResult)
+	if err != nil {
+		logger.Error("Failed to marshal signing result event", err)
+		return
+	}
+
+	natMsg.Ack()
+	err = ec.signingResultQueue.Enqueue(event.SigningResultCompleteTopic, signingResultBytes, &messaging.EnqueueOptions{
+		IdempotententKey: txID,
+	})
+	if err != nil {
+		logger.Error("Failed to publish signing result event", err)
+		return
+	}
+}
+
 // Add a cleanup routine that runs periodically
 func (ec *eventConsumer) sessionCleanupRoutine() {
 	ticker := time.NewTicker(ec.cleanupInterval)
@@ -296,6 +465,40 @@ func (ec *eventConsumer) cleanupStaleSessions() {
 			delete(ec.activeSessions, sessionID)
 		}
 	}
+}
+
+// markSessionAsActive marks a session as active with the current timestamp
+func (ec *eventConsumer) addSession(walletID, txID string) {
+	sessionID := fmt.Sprintf("%s-%s", walletID, txID)
+	ec.sessionsLock.Lock()
+	ec.activeSessions[sessionID] = time.Now()
+	ec.sessionsLock.Unlock()
+}
+
+// Remove a session from tracking
+func (ec *eventConsumer) removeSession(walletID, txID string) {
+	sessionID := fmt.Sprintf("%s-%s", walletID, txID)
+	ec.sessionsLock.Lock()
+	delete(ec.activeSessions, sessionID)
+	ec.sessionsLock.Unlock()
+}
+
+// checkAndTrackSession checks if a session already exists and tracks it if new.
+// Returns true if the session is a duplicate.
+func (ec *eventConsumer) checkDuplicateSession(walletID, txID string) bool {
+	sessionID := fmt.Sprintf("%s-%s", walletID, txID)
+
+	// Check for duplicate
+	ec.sessionsLock.RLock()
+	_, isDuplicate := ec.activeSessions[sessionID]
+	ec.sessionsLock.RUnlock()
+
+	if isDuplicate {
+		logger.Info("Duplicate signing request detected", "walletID", walletID, "txID", txID)
+		return true
+	}
+
+	return false
 }
 
 // Close and clean up

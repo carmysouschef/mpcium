@@ -7,21 +7,20 @@ import (
 	"syscall"
 
 	"github.com/fystack/mpcium/pkg/client"
-	"github.com/fystack/mpcium/pkg/config"
 	"github.com/fystack/mpcium/pkg/event"
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/types"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
-	"github.com/spf13/viper"
 )
 
 func main() {
-	const environment = "dev"
-	config.InitViperConfig()
+	const environment = "development"
+	// config.InitViperConfig()
 	logger.Init(environment, true)
 
-	natsURL := viper.GetString("nats.url")
+	// natsURL := viper.GetString("nats.url")
+	natsURL := "nats://localhost:4222"
 	natsConn, err := nats.Connect(natsURL)
 	if err != nil {
 		logger.Fatal("Failed to connect to NATS", err)
@@ -31,7 +30,7 @@ func main() {
 
 	mpcClient := client.NewMPCClient(client.Options{
 		NatsConn: natsConn,
-		KeyPath:  "./event_initiator.key",
+		KeyPath:  "./../../event_initiator.key",
 	})
 
 	// 2) Once wallet exists, immediately fire a SignTransaction
@@ -40,7 +39,7 @@ func main() {
 
 	txMsg := &types.SignTxMessage{
 		KeyType:             types.KeyTypeEd25519,
-		WalletID:            "77dd7e23-9d5c-4ff1-8759-f119d1b19b36",
+		WalletID:            "f14497df-35bc-4e14-a803-73848b937804",
 		NetworkInternalCode: "solana-devnet",
 		TxID:                txID,
 		Tx:                  dummyTx,

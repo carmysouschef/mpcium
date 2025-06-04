@@ -23,5 +23,5 @@ func (t *TopicComposer) ComposeDirectTopic(nodeID string) string {
 }
 
 func (t *TopicComposer) ComposeKeyInfoTopic() string {
-	return t.curveType + ":" + t.walletID
+	return t.curveType + "/" + t.walletID
 }

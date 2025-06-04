@@ -35,6 +35,11 @@ func (p *ECDSAParty) Init(participants tss.SortedPartyIDs, threshold int, prePar
 	p.BaseParty.Init(participants, threshold, sender)
 }
 
+func (p *ECDSAParty) InitSign(participants tss.SortedPartyIDs, threshold int, preParams keygen.LocalPreParams, sender Sender) {
+	p.preParams = preParams
+	p.BaseParty.Init(participants, threshold, sender)
+}
+
 func (p *ECDSAParty) InitReshare(oldParticipants tss.SortedPartyIDs, newParticipants tss.SortedPartyIDs, oldThreshold int, newThreshold int, preParams keygen.LocalPreParams, sender Sender) {
 	p.preParams = preParams
 	p.BaseParty.InitReshare(oldParticipants, newParticipants, oldThreshold, newThreshold, sender)

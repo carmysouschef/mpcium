@@ -18,8 +18,8 @@ type Session interface {
 	// HandleMessage processes an incoming message for this session
 	OnMsg(msg types.TssMessage)
 
-	// NotifyError notifies the session of an error
-	NotifyError()
+	// Err returns the error channel
+	Err() chan error
 
 	// Close terminates the session and releases resources
 	Close()

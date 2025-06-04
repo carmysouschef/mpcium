@@ -68,42 +68,56 @@ func NewNode(
 }
 
 // Create a keygen/sign session
-func (n *Node) CreateSession(curveType mpc.CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (session.Session, error) {
-	if n.peerRegistry.GetReadyPeersCount() < int64(threshold+1) {
-		return nil, fmt.Errorf("not enough peers to create gen session! Expected %d, got %d", threshold+1, n.peerRegistry.GetReadyPeersCount())
+func (n *Node) CreateSession(purpose string, curveType mpc.CurveType, walletID string, threshold int, successQueue messaging.MessageQueue) (session.Session, error) {
+	// Validate peer count
+	if err := n.validatePeerCount(purpose, threshold); err != nil {
+		return nil, err
 	}
 
-	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
-	selfPartyID, allPartyIDs := n.generatePartyIDs(PurposeKeygen, readyPeerIDs)
-	topicComposer := NewTopicComposer(PurposeKeygen, string(curveType), walletID)
-	sender := n.createSender(walletID, *topicComposer, allPartyIDs)
+	// Setup session parameters
+	selfPartyID, allPartyIDs, topicComposer, sender := n.setupSessionParams(purpose, curveType, walletID)
 
-	switch curveType {
-	case mpc.CurveECDSA:
-		ecdsaParty := session.NewECDSAParty(selfPartyID)
-		ecdsaParty.Init(allPartyIDs, threshold, *n.ecdsaPreParams, sender)
-		// Handle messages in a separate goroutine
-		go n.receiveMessages(ecdsaParty, *topicComposer)
-		return ecdsaParty, nil
-
-	case mpc.CurveEDDSA:
-		eddsaParty := session.NewEDDSAParty(selfPartyID)
-		eddsaParty.Init(allPartyIDs, threshold, sender)
-		// Handle messages in a separate goroutine
-		go n.receiveMessages(eddsaParty, *topicComposer)
-		return eddsaParty, nil
+	// Handle purpose-specific logic
+	var keyData []byte
+	var err error
+	switch purpose {
+	case PurposeKeygen:
+		if err := n.handleKeygenPurpose(topicComposer, walletID); err != nil {
+			return nil, err
+		}
+	case PurposeSign:
+		if keyData, err = n.handleSignPurpose(topicComposer, walletID); err != nil {
+			return nil, err
+		}
 	default:
-		return nil, fmt.Errorf("invalid curve type: %s", curveType)
+		return nil, fmt.Errorf("invalid purpose: %s", purpose)
 	}
 
+	// Create and initialize party
+	party, err := n.createParty(curveType, selfPartyID, allPartyIDs, threshold, sender, purpose, keyData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Start message handling in background
+	go n.receiveMessages(party, *topicComposer)
+
+	logger.Info("Created new session",
+		"purpose", purpose,
+		"curveType", curveType,
+		"walletID", walletID,
+		"threshold", threshold,
+		"partyID", selfPartyID.Id)
+
+	return party, nil
 }
 
 // Create a resharing session
 func (n *Node) CreateResharingSession(curveType mpc.CurveType, walletID string, oldThreshold, newThreshold int, successQueue messaging.MessageQueue) (session.Session, error) {
-	if n.peerRegistry.GetReadyPeersCount() < int64(newThreshold+1) {
-		return nil, fmt.Errorf("not enough peers to create resharing session! Expected %d, got %d", newThreshold+1, n.peerRegistry.GetReadyPeersCount())
+	// Validate peer count
+	if err := n.validatePeerCount(PurposeResharing, newThreshold); err != nil {
+		return nil, err
 	}
-
 	return nil, fmt.Errorf("resharing not yet implemented for curve type: %s", curveType)
 }
 
@@ -126,7 +140,7 @@ func (n *Node) SaveKeyData(purpose string, curveType mpc.CurveType, walletID str
 		logger.Error("Failed to save keyinfo", err, "walletID", walletID)
 		return err
 	}
-
+	logger.Info("Key data saved", "key", topicComposer.ComposeKeyInfoTopic())
 	return nil
 }
 
@@ -134,6 +148,69 @@ func (n *Node) SaveKeyData(purpose string, curveType mpc.CurveType, walletID str
 func (n *Node) Close() {
 	if err := n.peerRegistry.Resign(); err != nil {
 		logger.Error("Resign failed", err)
+	}
+}
+
+// validatePeerCount checks if there are enough peers for the session
+func (n *Node) validatePeerCount(purpose string, threshold int) error {
+	readyCount := n.peerRegistry.GetReadyPeersCount()
+	if readyCount < int64(threshold+1) {
+		return fmt.Errorf("not enough peers for %s session: need %d, have %d",
+			purpose, threshold+1, readyCount)
+	}
+	return nil
+}
+
+// setupSessionParams initializes the basic session parameters
+func (n *Node) setupSessionParams(purpose string, curveType mpc.CurveType, walletID string) (*tss.PartyID, tss.SortedPartyIDs, *TopicComposer, session.Sender) {
+	readyPeerIDs := n.peerRegistry.GetReadyPeersIncludeSelf()
+	selfPartyID, allPartyIDs := n.generatePartyIDs(purpose, readyPeerIDs)
+	topicComposer := NewTopicComposer(purpose, string(curveType), walletID)
+	sender := n.createSender(walletID, *topicComposer, allPartyIDs)
+	return selfPartyID, allPartyIDs, topicComposer, sender
+}
+
+// handleKeygenPurpose handles keygen-specific logic
+func (n *Node) handleKeygenPurpose(topicComposer *TopicComposer, walletID string) error {
+	if keyInfo, _ := n.keyinfoStore.Get(topicComposer.ComposeKeyInfoTopic()); keyInfo != nil {
+		return fmt.Errorf("key already exists for wallet %s", walletID)
+	}
+	return nil
+}
+
+// handleSignPurpose handles sign-specific logic
+func (n *Node) handleSignPurpose(topicComposer *TopicComposer, walletID string) ([]byte, error) {
+	keyData, err := n.kvstore.Get(topicComposer.ComposeKeyInfoTopic())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key data: %w", err)
+	}
+	if keyData == nil {
+		return nil, fmt.Errorf("key data not found for wallet %s", walletID)
+	}
+	return keyData, nil
+}
+
+// createParty creates and initializes a party based on curve type
+func (n *Node) createParty(curveType mpc.CurveType, selfPartyID *tss.PartyID, allPartyIDs tss.SortedPartyIDs, threshold int, sender session.Sender, purpose string, keyData []byte) (session.Session, error) {
+	switch curveType {
+	case mpc.CurveECDSA:
+		party := session.NewECDSAParty(selfPartyID)
+		party.Init(allPartyIDs, threshold, *n.ecdsaPreParams, sender)
+		if purpose == PurposeSign {
+			party.SetShareData(keyData)
+		}
+		return party, nil
+
+	case mpc.CurveEDDSA:
+		party := session.NewEDDSAParty(selfPartyID)
+		party.Init(allPartyIDs, threshold, sender)
+		if purpose == PurposeSign {
+			party.SetShareData(keyData)
+		}
+		return party, nil
+
+	default:
+		return nil, fmt.Errorf("invalid curve type: %s", curveType)
 	}
 }
 

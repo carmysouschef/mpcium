@@ -75,6 +75,10 @@ func (p *BaseParty) OnMsg(msg types.TssMessage) {
 	}
 }
 
+func (p *BaseParty) Err() chan error {
+	return p.ErrChan
+}
+
 func (p *BaseParty) NotifyError() {
 	for err := range p.ErrChan {
 		log.Printf("Party %s received error: %v", p.PartyID.Id, err)
